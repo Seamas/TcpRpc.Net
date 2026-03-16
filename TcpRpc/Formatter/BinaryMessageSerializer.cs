@@ -219,7 +219,7 @@ public class BinaryMessageSerializer : IMessageSerializer
             default:
                 // 复杂对象使用JSON序列化作为后备，同时存储类型信息
                 writer.Write(TypeObject);
-                WriteString(writer, type.FullName + "," + type.Assembly.GetName()); // 存储类型名称
+                WriteString(writer, type.AssemblyQualifiedName); // 存储类型名称
                 var jsonBytes = System.Text.Json.JsonSerializer.SerializeToUtf8Bytes(obj, type);
                 writer.Write(jsonBytes.Length);
                 writer.Write(jsonBytes);
