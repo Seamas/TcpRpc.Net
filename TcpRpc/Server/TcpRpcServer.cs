@@ -1,16 +1,20 @@
 using System.Collections.Concurrent;
 using System.Net;
 using System.Net.Sockets;
+using Microsoft.Extensions.Logging;
+using Microsoft.Extensions.Logging.Abstractions;
 using TcpRpc.Formatter;
 using TcpRpc.Message;
 
 namespace TcpRpc.Server;
 
 
-public class RpcServer(int port, IMessageSerializer? serializer = null) : IDisposable
+public class RpcServer : IDisposable
 {
-    private readonly IMessageSerializer _serializer = serializer ?? new JsonMessageSerializer();
-    private readonly CancellationTokenSource _cts = new();
+    private readonly int _port;
+    private readonly IMessageSerializer _serializer;
+    private readonly ILogger<RpcServer> _logger;
+    private CancellationTokenSource _cts = new();
     private readonly List<Task> _clientTasks = [];
     private readonly ConcurrentDictionary<string, RequestHandler> _handlers = new();
     
@@ -24,7 +28,24 @@ public class RpcServer(int port, IMessageSerializer? serializer = null) : IDispo
 
     public RpcServerState State => _state;
     
-    public int ActiveConnections => _clientTasks.Count;
+    public int ActiveConnections 
+    { 
+        get 
+        { 
+            lock (_clientTasks)
+            {
+                _clientTasks.RemoveAll(t => t.IsCompleted);
+                return _clientTasks.Count;
+            }
+        }
+    }
+
+    public RpcServer(int port, IMessageSerializer? serializer = null, ILogger<RpcServer>? logger = null)
+    {
+        _port = port;
+        _serializer = serializer ?? new JsonMessageSerializer();
+        _logger = logger ?? NullLogger<RpcServer>.Instance;
+    }
 
     public void RegisterHandler(string method, RequestHandler handler)
     {
@@ -46,6 +67,15 @@ public class RpcServer(int port, IMessageSerializer? serializer = null) : IDispo
             try
             {
                 var requestData = System.Text.Json.JsonSerializer.Deserialize<TRequest>(request.Data);
+                if (requestData == null)
+                {
+                    return new ResponseMessage
+                    {
+                        MessageId = request.MessageId,
+                        Success = false,
+                        Error = "Failed to deserialize request data"
+                    };
+                }
                 var responseData = await handler(requestData);
                 var responseBytes = System.Text.Json.JsonSerializer.SerializeToUtf8Bytes(responseData);
 
@@ -82,13 +112,14 @@ public class RpcServer(int port, IMessageSerializer? serializer = null) : IDispo
 
         try
         {
-            _listener = new TcpListener(IPAddress.Any, port);
+            _listener = new TcpListener(IPAddress.Any, _port);
             _listener.Start();
 
-            // 清除取消令牌
-            while (_cts.IsCancellationRequested)
+            // 如果CTS已被取消，重新创建
+            if (_cts.IsCancellationRequested)
             {
-                // 重新创建CTS
+                _cts.Dispose();
+                _cts = new CancellationTokenSource();
             }
 
             var cancellationToken = _cts.Token;
@@ -98,7 +129,7 @@ public class RpcServer(int port, IMessageSerializer? serializer = null) : IDispo
                 _state = RpcServerState.Running;
             }
 
-            Console.WriteLine($"Server started on port {port}");
+            _logger.LogInformation("Server started on port {Port}", _port);
 
             try
             {
@@ -121,7 +152,7 @@ public class RpcServer(int port, IMessageSerializer? serializer = null) : IDispo
                 // Normal shutdown
             }
         }
-        catch (Exception ex)
+        catch (Exception)
         {
             lock (_stateLock)
             {
@@ -176,7 +207,7 @@ public class RpcServer(int port, IMessageSerializer? serializer = null) : IDispo
                 }
                 catch (TimeoutException)
                 {
-                    Console.WriteLine($"Timeout waiting for {tasks.Length} clients to disconnect");
+                    _logger.LogWarning("Timeout waiting for {Count} clients to disconnect", tasks.Length);
                 }
             }
 
@@ -197,7 +228,7 @@ public class RpcServer(int port, IMessageSerializer? serializer = null) : IDispo
     private async Task HandleClientAsync(TcpClient client, int clientId, CancellationToken cancellationToken)
     {
         var endpoint = client.Client.RemoteEndPoint?.ToString() ?? "unknown";
-        Console.WriteLine($"Client {clientId} connected: {endpoint}");
+        _logger.LogInformation("Client {ClientId} connected: {Endpoint}", clientId, endpoint);
 
         try
         {
@@ -222,7 +253,7 @@ public class RpcServer(int port, IMessageSerializer? serializer = null) : IDispo
                                 MessageHeader.HeaderSize - bytesRead), linkedCts.Token);
                             if (read == 0)
                             {
-                                Console.WriteLine($"Client {clientId} disconnected");
+                                _logger.LogInformation("Client {ClientId} disconnected", clientId);
                                 return;
                             }
                             bytesRead += read;
@@ -244,10 +275,10 @@ public class RpcServer(int port, IMessageSerializer? serializer = null) : IDispo
                         while (bytesRead < header.ContentLength)
                         {
                             var read = await stream.ReadAsync(contentBuffer.AsMemory(bytesRead, 
-                                (int)(header.ContentLength - bytesRead)), linkedCts.Token);
+                                header.ContentLength - bytesRead), linkedCts.Token);
                             if (read == 0)
                             {
-                                Console.WriteLine($"Client {clientId} disconnected during content read");
+                                _logger.LogInformation("Client {ClientId} disconnected during content read", clientId);
                                 return;
                             }
                             bytesRead += read;
@@ -268,7 +299,7 @@ public class RpcServer(int port, IMessageSerializer? serializer = null) : IDispo
                     }
                     catch (Exception ex)
                     {
-                        Console.WriteLine($"Error processing client {clientId} message: {ex.Message}");
+                        _logger.LogError(ex, "Error processing client {ClientId} message", clientId);
                         // Continue to next message
                     }
                 }
@@ -276,11 +307,11 @@ public class RpcServer(int port, IMessageSerializer? serializer = null) : IDispo
         }
         catch (Exception ex)
         {
-            Console.WriteLine($"Error handling client {clientId}: {ex.Message}");
+            _logger.LogError(ex, "Error handling client {ClientId}", clientId);
         }
         finally
         {
-            Console.WriteLine($"Client {clientId} disconnected: {endpoint}");
+            _logger.LogInformation("Client {ClientId} disconnected: {Endpoint}", clientId, endpoint);
         }
     }
 

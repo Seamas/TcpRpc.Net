@@ -1,22 +1,25 @@
 using System.Collections.Concurrent;
 using System.Net.Sockets;
 using System.Text.Json;
+using Microsoft.Extensions.Logging;
+using Microsoft.Extensions.Logging.Abstractions;
 using TcpRpc.Formatter;
 using TcpRpc.Message;
 
 namespace TcpRpc.Client;
 
-public class RpcClient(string host, int port, IMessageSerializer? serializer = null)
-    : IDisposable
+public class RpcClient : IDisposable
 {
-    private readonly string _host = host ?? throw new ArgumentNullException(nameof(host));
-    private readonly IMessageSerializer _serializer = serializer ?? new JsonMessageSerializer();
+    private readonly string _host;
+    private readonly int _port;
+    private readonly IMessageSerializer _serializer;
+    private readonly ILogger<RpcClient> _logger;
 
     private readonly ConcurrentDictionary<long, TaskCompletionSource<ResponseMessage>> _pendingRequests = new();
     private long _nextMessageId;
     private readonly SemaphoreSlim _sendLock = new(1, 1);
     private readonly CancellationTokenSource _cts = new();
-    
+    private readonly ConcurrentDictionary<long, TaskCompletionSource<bool>> _pendingPings = new();
     
     private TcpClient? _tcpClient;
     private NetworkStream? _stream;
@@ -29,6 +32,18 @@ public class RpcClient(string host, int port, IMessageSerializer? serializer = n
 
     public RpcClientState State => _state;
 
+    public RpcClient(string host, int port, IMessageSerializer? serializer = null, ILogger<RpcClient>? logger = null)
+    {
+        _host = host ?? throw new ArgumentNullException(nameof(host));
+        _port = port;
+        _serializer = serializer ?? new JsonMessageSerializer();
+        _logger = logger ?? NullLogger<RpcClient>.Instance;
+    }
+
+    /// <summary>
+    /// 连接
+    /// </summary>
+    /// <exception cref="InvalidOperationException"></exception>
     public async Task ConnectAsync()
     {
         CheckDisposed();
@@ -44,7 +59,7 @@ public class RpcClient(string host, int port, IMessageSerializer? serializer = n
         try
         {
             _tcpClient = new TcpClient();
-            await _tcpClient.ConnectAsync(_host, port);
+            await _tcpClient.ConnectAsync(_host, _port);
             _stream = _tcpClient.GetStream();
 
             _receiveTask = ReceiveAsync(_cts.Token);
@@ -64,6 +79,9 @@ public class RpcClient(string host, int port, IMessageSerializer? serializer = n
         }
     }
 
+    /// <summary>
+    /// 断开
+    /// </summary>
     public async Task DisconnectAsync()
     {
         CheckDisposed();
@@ -78,7 +96,7 @@ public class RpcClient(string host, int port, IMessageSerializer? serializer = n
 
         try
         {
-            _cts.Cancel();
+            await _cts.CancelAsync();
             
             if (_receiveTask != null)
             {
@@ -148,8 +166,8 @@ public class RpcClient(string host, int port, IMessageSerializer? serializer = n
             try
             {
                 var headerBuffer = header.Serialize();
-                await _stream!.WriteAsync(headerBuffer, 0, headerBuffer.Length, linkedCts.Token);
-                await _stream!.WriteAsync(requestData, 0, requestData.Length, linkedCts.Token);
+                await _stream!.WriteAsync(headerBuffer,  linkedCts.Token);
+                await _stream!.WriteAsync(requestData,  linkedCts.Token);
             }
             finally
             {
@@ -170,18 +188,18 @@ public class RpcClient(string host, int port, IMessageSerializer? serializer = n
         }
     }
 
-    public async Task<T> SendRequestAsync<T>(string method, object data)
+    public async Task<T> SendRequestAsync<T>(string method, object data, int timeoutMs = 30000)
     {
         var dataBytes = JsonSerializer.SerializeToUtf8Bytes(data);
         
-        var response = await SendRequestAsync(method, dataBytes);
+        var response = await SendRequestAsync(method, dataBytes, timeoutMs);
 
         if (!response.Success)
-            throw new Exception($"Request failed: {response.Error}");
+            throw new InvalidOperationException($"Request failed: {response.Error}");
 
         var result = JsonSerializer.Deserialize<T>(response.Data);
         
-        return result ?? throw new NullReferenceException($"Response data is null");
+        return result ?? throw new InvalidOperationException($"Response data is null");
     }
 
     private async Task ReceiveAsync(CancellationToken cancellationToken)
@@ -217,14 +235,14 @@ public class RpcClient(string host, int port, IMessageSerializer? serializer = n
         }
     }
 
-    private async Task<byte[]> ReadBytesAsync(long bufferSize, CancellationToken cancellationToken)
+    private async Task<byte[]> ReadBytesAsync(int bufferSize, CancellationToken cancellationToken)
     {
         var bytesRead = 0;
         var buffer = new byte[bufferSize];
-        while (bytesRead < MessageHeader.HeaderSize)
+        while (bytesRead < bufferSize)
         {
             var read = await _stream!.ReadAsync(buffer.AsMemory(bytesRead, 
-                MessageHeader.HeaderSize - bytesRead), cancellationToken);
+                bufferSize - bytesRead), cancellationToken);
             if (read == 0)
             {
                 // Connection closed by server
@@ -237,7 +255,7 @@ public class RpcClient(string host, int port, IMessageSerializer? serializer = n
         return buffer;
     }
 
-    private async Task ProcessMessageAsync(MessageHeader header, byte[] content)
+    private Task ProcessMessageAsync(MessageHeader header, byte[] content)
     {
         switch (header.Type)
         {
@@ -253,10 +271,19 @@ public class RpcClient(string host, int port, IMessageSerializer? serializer = n
                 var errorMsg = System.Text.Encoding.UTF8.GetString(content);
                 if (_pendingRequests.TryRemove(header.MessageId, out var errorTcs))
                 {
-                    errorTcs.TrySetException(new Exception($"Server error: {errorMsg}"));
+                    errorTcs.TrySetException(new InvalidOperationException($"Server error: {errorMsg}"));
+                }
+                break;
+
+            case MessageType.Pong:
+                if (_pendingPings.TryRemove(header.MessageId, out var pingTcs))
+                {
+                    pingTcs.TrySetResult(true);
                 }
                 break;
         }
+
+        return Task.CompletedTask;
     }
 
     private async Task HandleConnectionLostAsync(string reason)
@@ -277,7 +304,8 @@ public class RpcClient(string host, int port, IMessageSerializer? serializer = n
 
         await Task.CompletedTask;
     }
-
+    
+    
     private bool IsConnected()
     {
         return _tcpClient?.Connected == true && _stream != null && _state == RpcClientState.Connected;
@@ -289,6 +317,11 @@ public class RpcClient(string host, int port, IMessageSerializer? serializer = n
             throw new ObjectDisposedException(nameof(RpcClient));
     }
 
+    /// <summary>
+    /// 心跳检测
+    /// </summary>
+    /// <param name="timeoutMs"></param>
+    /// <returns></returns>
     public async Task<bool> PingAsync(int timeoutMs = 5000)
     {
         CheckDisposed();
@@ -296,10 +329,17 @@ public class RpcClient(string host, int port, IMessageSerializer? serializer = n
         if (_state != RpcClientState.Connected)
             return false;
 
+        var messageId = Interlocked.Increment(ref _nextMessageId);
+        var tcs = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+        
+        if (!_pendingPings.TryAdd(messageId, tcs))
+        {
+            _logger.LogWarning("Failed to add pending ping {MessageId}", messageId);
+            return false;
+        }
+
         try
         {
-            var messageId = Interlocked.Increment(ref _nextMessageId);
-
             var header = new MessageHeader
             {
                 Type = MessageType.Ping,
@@ -307,25 +347,37 @@ public class RpcClient(string host, int port, IMessageSerializer? serializer = n
                 ContentLength = 0
             };
 
-            await _sendLock.WaitAsync();
+            using var timeoutCts = new CancellationTokenSource(timeoutMs);
+            using var linkedCts = CancellationTokenSource.CreateLinkedTokenSource(timeoutCts.Token, _cts.Token);
+
+            await _sendLock.WaitAsync(linkedCts.Token);
             try
             {
                 var headerBuffer = header.Serialize();
-                await _stream!.WriteAsync(headerBuffer, 0, headerBuffer.Length);
+                await _stream!.WriteAsync(headerBuffer, 0, headerBuffer.Length, linkedCts.Token);
             }
             finally
             {
                 _sendLock.Release();
             }
 
-            // Wait for pong
-            using var cts = new CancellationTokenSource(timeoutMs);
-            // TODO: 实际应该有对应的pong处理
+            // Wait for pong with timeout
+            await tcs.Task.WaitAsync(linkedCts.Token);
             return true;
         }
-        catch
+        catch (OperationCanceledException) when (!_cts.IsCancellationRequested)
         {
+            _logger.LogWarning("Ping {MessageId} timed out after {TimeoutMs}ms", messageId, timeoutMs);
             return false;
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Ping {MessageId} failed", messageId);
+            return false;
+        }
+        finally
+        {
+            _pendingPings.TryRemove(messageId, out _);
         }
     }
 

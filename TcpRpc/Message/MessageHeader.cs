@@ -1,3 +1,5 @@
+using System.Buffers.Binary;
+
 namespace TcpRpc.Message;
 
 public class MessageHeader
@@ -6,14 +8,14 @@ public class MessageHeader
 
     public MessageType Type { get; set; }
     public long MessageId { get; set; }
-    public long ContentLength { get; set; }
+    public int ContentLength { get; set; }
 
     public byte[] Serialize()
     {
         var buffer = new byte[HeaderSize];
         buffer[0] = (byte)Type;
-        BitConverter.GetBytes(MessageId).CopyTo(buffer, 1);
-        BitConverter.GetBytes(ContentLength).CopyTo(buffer, 9);
+        BinaryPrimitives.WriteInt64LittleEndian(buffer.AsSpan(1), MessageId);
+        BinaryPrimitives.WriteInt32LittleEndian(buffer.AsSpan(9), ContentLength);
         return buffer;
     }
 
@@ -25,8 +27,8 @@ public class MessageHeader
         return new MessageHeader
         {
             Type = (MessageType)buffer[0],
-            MessageId = BitConverter.ToInt64(buffer, 1),
-            ContentLength = BitConverter.ToInt64(buffer, 9)
+            MessageId = BinaryPrimitives.ReadInt64LittleEndian(buffer.AsSpan(1)),
+            ContentLength = BinaryPrimitives.ReadInt32LittleEndian(buffer.AsSpan(9))
         };
     }
 }
