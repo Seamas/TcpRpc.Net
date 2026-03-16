@@ -2,36 +2,42 @@ using System.Collections.Concurrent;
 using System.Net;
 using System.Net.Sockets;
 using Microsoft.Extensions.Logging;
-using Microsoft.Extensions.Logging.Abstractions;
 using TcpRpc.Formatter;
 using TcpRpc.Message;
 
 namespace TcpRpc.Server;
 
-
-public class RpcServer : IDisposable
+/// <summary>
+/// TCP RPC服务器 - 支持服务注册和拦截器
+/// </summary>
+public class TcpRpcServer : IDisposable
 {
     private readonly int _port;
     private readonly IMessageSerializer _serializer;
-    private readonly ILogger<RpcServer> _logger;
+    private readonly ILogger<TcpRpcServer> _logger;
     private CancellationTokenSource _cts = new();
     private readonly List<Task> _clientTasks = [];
     private readonly ConcurrentDictionary<string, RequestHandler> _handlers = new();
-    
+
     private TcpListener? _listener;
-    
+
     // 状态管理
     private volatile RpcServerState _state = RpcServerState.Stopped;
     private readonly Lock _stateLock = new();
     private int _disposed;
     private int _clientCounter;
 
+    /// <summary>
+    /// 服务注册表
+    /// </summary>
+    public ServiceRegistry ServiceRegistry { get; }
+
     public RpcServerState State => _state;
-    
-    public int ActiveConnections 
-    { 
-        get 
-        { 
+
+    public int ActiveConnections
+    {
+        get
+        {
             lock (_clientTasks)
             {
                 _clientTasks.RemoveAll(t => t.IsCompleted);
@@ -40,62 +46,21 @@ public class RpcServer : IDisposable
         }
     }
 
-    public RpcServer(int port, IMessageSerializer? serializer = null, ILogger<RpcServer>? logger = null)
+    public TcpRpcServer(int port, IMessageSerializer serializer, ILoggerFactory factory)
     {
         _port = port;
-        _serializer = serializer ?? new JsonMessageSerializer();
-        _logger = logger ?? NullLogger<RpcServer>.Instance;
+        _serializer = serializer;
+        _logger = factory.CreateLogger<TcpRpcServer>();
+        ServiceRegistry = new ServiceRegistry(factory);
     }
 
-    public void RegisterHandler(string method, RequestHandler handler)
+    
+    /// <summary>
+    /// 注册服务实现（新API）
+    /// </summary>
+    public void RegisterService<TInterface, TImplementation>(TImplementation instance) where TImplementation : class, TInterface
     {
-        CheckDisposed();
-        
-        if (_state != RpcServerState.Stopped)
-            throw new InvalidOperationException($"Cannot register handler while server is {_state}");
-
-        _handlers[method] = handler ?? throw new ArgumentNullException(nameof(handler));
-    }
-
-    public void RegisterHandler<TRequest, TResponse>(string method, 
-        Func<TRequest, Task<TResponse>> handler)
-    {
-        CheckDisposed();
-
-        _handlers[method] = async (request) =>
-        {
-            try
-            {
-                var requestData = System.Text.Json.JsonSerializer.Deserialize<TRequest>(request.Data);
-                if (requestData == null)
-                {
-                    return new ResponseMessage
-                    {
-                        MessageId = request.MessageId,
-                        Success = false,
-                        Error = "Failed to deserialize request data"
-                    };
-                }
-                var responseData = await handler(requestData);
-                var responseBytes = System.Text.Json.JsonSerializer.SerializeToUtf8Bytes(responseData);
-
-                return new ResponseMessage
-                {
-                    MessageId = request.MessageId,
-                    Success = true,
-                    Data = responseBytes
-                };
-            }
-            catch (Exception ex)
-            {
-                return new ResponseMessage
-                {
-                    MessageId = request.MessageId,
-                    Success = false,
-                    Error = ex.Message
-                };
-            }
-        };
+        ServiceRegistry.Register<TInterface, TImplementation>(instance);
     }
 
     public async Task StartAsync()
@@ -323,7 +288,7 @@ public class RpcServer : IDisposable
             case MessageType.Request:
                 var request = _serializer.DeserializeRequest(content);
                 var response = await ProcessRequestAsync(request);
-                await SendResponseAsync(stream, response, cancellationToken);
+                await SendResponseAsync(stream, response, header.MessageId, cancellationToken);
                 break;
 
             case MessageType.Ping:
@@ -336,14 +301,53 @@ public class RpcServer : IDisposable
     {
         try
         {
+            // 首先尝试从旧版处理器查找
             if (_handlers.TryGetValue(request.Method, out var handler))
             {
                 return await handler(request);
             }
 
+            // 尝试从服务注册表查找（新API）
+            if (!string.IsNullOrEmpty(request.ServiceType))
+            {
+                var result = await ServiceRegistry.InvokeAsync(
+                    request.ServiceType,
+                    request.Method,
+                    request.Parameters,
+                    request.ParameterTypes);
+
+                if (result.Success)
+                {
+                    return new ResponseMessage
+                    {
+                        Success = true,
+                        Data = result.Value,
+                        DataType = result.ValueType?.FullName,
+                        IsVoid = result.IsVoid
+                    };
+                }
+                else if (result.Exception != null)
+                {
+                    return new ResponseMessage
+                    {
+                        Success = false,
+                        Error = result.Error,
+                        ExceptionType = result.Exception.GetType().FullName,
+                        StackTrace = result.Exception.StackTrace
+                    };
+                }
+                else
+                {
+                    return new ResponseMessage
+                    {
+                        Success = false,
+                        Error = result.Error
+                    };
+                }
+            }
+
             return new ResponseMessage
             {
-                MessageId = request.MessageId,
                 Success = false,
                 Error = $"Method '{request.Method}' not found"
             };
@@ -352,27 +356,29 @@ public class RpcServer : IDisposable
         {
             return new ResponseMessage
             {
-                MessageId = request.MessageId,
                 Success = false,
-                Error = $"Handler error: {ex.Message}"
+                Error = $"Handler error: {ex.Message}",
+                ExceptionType = ex.GetType().FullName,
+                StackTrace = ex.StackTrace
             };
         }
     }
 
-    private async Task SendResponseAsync(NetworkStream stream, ResponseMessage response, 
+    private async Task SendResponseAsync(NetworkStream stream, ResponseMessage response, long messageId,
         CancellationToken cancellationToken)
     {
         var responseData = _serializer.SerializeResponse(response);
         var responseHeader = new MessageHeader
         {
             Type = response.Success ? MessageType.Response : MessageType.Error,
-            MessageId = response.MessageId,
+            MessageId = messageId,
             ContentLength = responseData.Length
         };
 
         var headerBytes = responseHeader.Serialize();
-        await stream.WriteAsync(headerBytes, 0, headerBytes.Length, cancellationToken);
-        await stream.WriteAsync(responseData, 0, responseData.Length, cancellationToken);
+        await stream.WriteAsync(headerBytes,  cancellationToken);
+        await stream.WriteAsync(responseData, cancellationToken);
+        await stream.FlushAsync(cancellationToken);
     }
 
     private async Task SendErrorResponseAsync(NetworkStream stream, long messageId, 
@@ -387,8 +393,9 @@ public class RpcServer : IDisposable
         };
 
         var headerBytes = header.Serialize();
-        await stream.WriteAsync(headerBytes, 0, headerBytes.Length, cancellationToken);
-        await stream.WriteAsync(errorData, 0, errorData.Length, cancellationToken);
+        await stream.WriteAsync(headerBytes,  cancellationToken);
+        await stream.WriteAsync(errorData,  cancellationToken);
+        await stream.FlushAsync(cancellationToken);
     }
 
     private async Task SendPongAsync(NetworkStream stream, long messageId, 
@@ -402,14 +409,15 @@ public class RpcServer : IDisposable
         };
 
         var headerBytes = header.Serialize();
-        await stream.WriteAsync(headerBytes, 0, headerBytes.Length, cancellationToken);
+        await stream.WriteAsync(headerBytes,  cancellationToken);
+        await stream.FlushAsync(cancellationToken);
     }
 
     private void CheckDisposed()
     {
         if (Interlocked.CompareExchange(ref _disposed, 0, 0) != 1) return;
         
-        throw new ObjectDisposedException(nameof(RpcServer));
+        throw new ObjectDisposedException(nameof(TcpRpcServer));
     }
 
     public void Dispose()

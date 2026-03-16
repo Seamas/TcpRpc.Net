@@ -1,3 +1,8 @@
 <Solution>
+  <Folder Name="/demo/">
+    <Project Path="TcpRpc.Client/TcpRpc.Client.csproj" />
+    <Project Path="TcpRpc.Contract/TcpRpc.Contract.csproj" />
+    <Project Path="TcpRpc.Server/TcpRpc.Server.csproj" />
+  </Folder>
   <Project Path="TcpRpc/TcpRpc.csproj" />
 </Solution>
