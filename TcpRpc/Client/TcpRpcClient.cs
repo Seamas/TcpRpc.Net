@@ -3,6 +3,7 @@ using System.Net.Sockets;
 using Microsoft.Extensions.Logging;
 using TcpRpc.Formatter;
 using TcpRpc.Message;
+using TcpRpc.Network;
 
 namespace TcpRpc.Client;
 
@@ -12,39 +13,71 @@ public class TcpRpcClient : IDisposable
     private readonly int _port;
     private readonly IMessageSerializer _serializer;
     private readonly ILogger<TcpRpcClient> _logger;
+    private readonly ClientAuthOptions _authOptions;
 
     private readonly ConcurrentDictionary<long, TaskCompletionSource<ResponseMessage>> _pendingRequests = new();
+    private readonly ConcurrentDictionary<long, TaskCompletionSource<AuthResponseMessage>> _pendingAuthRequests = new();
     private long _nextMessageId = 1;
     private readonly SemaphoreSlim _sendLock = new(1, 1);
-    private readonly CancellationTokenSource _cts = new();
+    private CancellationTokenSource _cts = new();
     private readonly ConcurrentDictionary<long, TaskCompletionSource<bool>> _pendingPings = new();
-    
+
     private TcpClient? _tcpClient;
     private NetworkStream? _stream;
     private Task? _receiveTask;
-    
+
     // 状态管理
     private volatile RpcClientState _state = RpcClientState.Created;
-    private readonly Lock _stateLock = new ();
+    private readonly Lock _stateLock = new();
     private int _disposed; // 使用int作为轻量级标志，0=未释放，1=已释放
+
+    // 认证状态
+    private string? _clientId;
+    private string? _authToken;
+    private DateTime? _tokenExpiresAt;
+    private int _reconnectAttemptCount;
 
     public RpcClientState State => _state;
 
-    public TcpRpcClient(string host, int port, IMessageSerializer serializer, ILoggerFactory factory)
+    /// <summary>
+    /// 是否已认证
+    /// </summary>
+    public bool IsAuthenticated => !string.IsNullOrEmpty(_authToken);
+
+    /// <summary>
+    /// 当前认证 Token
+    /// </summary>
+    public string? AuthToken => _authToken;
+
+    /// <summary>
+    /// 客户端标识
+    /// </summary>
+    public string? ClientId => _clientId;
+
+    /// <summary>
+    /// Token 过期时间
+    /// </summary>
+    public DateTime? TokenExpiresAt => _tokenExpiresAt;
+
+    public TcpRpcClient(string host, int port, IMessageSerializer serializer, ILoggerFactory factory, ClientAuthOptions? authOptions = null)
     {
         _host = host ?? throw new ArgumentNullException(nameof(host));
         _port = port;
         _serializer = serializer;
         _logger = factory.CreateLogger<TcpRpcClient>();
+        _authOptions = authOptions ?? new ClientAuthOptions();
     }
 
     /// <summary>
     /// 连接
     /// </summary>
     /// <exception cref="InvalidOperationException"></exception>
-    public async Task ConnectAsync()
+    public async Task ConnectAsync(CancellationToken cancellationToken = default)
     {
-        CheckDisposed();
+        if (IsDisposed())
+        {
+            throw new InvalidOperationException($"Client is disposed.");
+        }
 
         lock (_stateLock)
         {
@@ -59,27 +92,31 @@ public class TcpRpcClient : IDisposable
             // 清理旧资源
             _stream?.Dispose();
             _tcpClient?.Dispose();
-            
+
             // 如果CTS已被取消，重新创建
             if (_cts.IsCancellationRequested)
             {
                 _cts.Dispose();
+                _cts = new CancellationTokenSource();
             }
 
             _tcpClient = new TcpClient();
-            await _tcpClient.ConnectAsync(_host, _port);
+            await _tcpClient.ConnectAsync(_host, _port).WaitAsync(_authOptions.ConnectTimeout, cancellationToken);
             _stream = _tcpClient.GetStream();
 
             _logger.LogInformation("Connected to server {Host}:{Port}", _host, _port);
 
             // 先启动接收任务，再设置状态，避免竞态条件
-            // ReceiveAsync 现在只检查 _stream != null，不依赖 _state
             _receiveTask = ReceiveAsync(_cts.Token);
-            
+
             lock (_stateLock)
             {
                 _state = RpcClientState.Connected;
             }
+
+            // 重置重连计数
+            _reconnectAttemptCount = 0;
+            _authOptions.ReconnectPolicy.Reset();
         }
         catch (Exception ex)
         {
@@ -93,11 +130,153 @@ public class TcpRpcClient : IDisposable
     }
 
     /// <summary>
+    /// 连接并认证
+    /// </summary>
+    public async Task ConnectAndAuthenticateAsync(CancellationToken cancellationToken = default)
+    {
+        await ConnectAsync(cancellationToken);
+        await AuthenticateAsync(cancellationToken);
+    }
+
+    /// <summary>
+    /// 执行认证
+    /// </summary>
+    public async Task AuthenticateAsync(CancellationToken cancellationToken = default)
+    {
+        if (IsDisposed())
+        {
+            throw new InvalidOperationException($"Client is disposed.");
+        }
+
+        if (_state != RpcClientState.Connected)
+            throw new InvalidOperationException($"Client is not connected. Current state: {_state}");
+
+        var isReconnect = !string.IsNullOrEmpty(_authToken);
+
+        var authRequest = new AuthRequestMessage
+        {
+            ClientId = _clientId ?? _authOptions.ClientId,
+            PreviousToken = isReconnect ? _authToken : null,
+            Credentials = _authOptions.Credentials
+        };
+
+        var messageId = Interlocked.Increment(ref _nextMessageId);
+        var tcs = new TaskCompletionSource<AuthResponseMessage>(TaskCreationOptions.RunContinuationsAsynchronously);
+
+        if (!_pendingAuthRequests.TryAdd(messageId, tcs))
+            throw new InvalidOperationException($"Failed to add pending auth request {messageId}");
+
+        try
+        {
+            var requestData = _serializer.SerializeAuthRequest(authRequest);
+            var header = new MessageHeader
+            {
+                Type = MessageType.AuthRequest,
+                MessageId = messageId,
+                ContentLength = requestData.Length
+            };
+
+            using var timeoutCts = new CancellationTokenSource(_authOptions.AuthTimeout);
+            using var linkedCts = CancellationTokenSource.CreateLinkedTokenSource(timeoutCts.Token, _cts.Token, cancellationToken);
+
+            await _sendLock.WaitAsync(linkedCts.Token);
+            try
+            {
+                await NetworkService.WriteMessageAsync(_stream!, header, requestData, linkedCts.Token);
+                
+                _logger.LogDebug("Auth request {MessageId} sent", messageId);
+            }
+            finally
+            {
+                _sendLock.Release();
+            }
+
+            var response = await tcs.Task.WaitAsync(linkedCts.Token);
+
+            if (!response.Success)
+            {
+                throw new RpcException($"Authentication failed: {response.ErrorMessage}");
+            }
+
+            // 保存认证信息
+            _clientId = response.ClientId;
+            _authToken = response.Token;
+            _tokenExpiresAt = response.ExpiresAt;
+
+            if (response.IsSessionRestored)
+            {
+                _logger.LogInformation("Session restored successfully for client {ClientId}", _clientId);
+            }
+            else
+            {
+                _logger.LogInformation("Authenticated successfully as {ClientId}", _clientId);
+            }
+        }
+        catch (OperationCanceledException) when (!cancellationToken.IsCancellationRequested)
+        {
+            _pendingAuthRequests.TryRemove(messageId, out _);
+            _logger.LogWarning("Authentication timed out");
+            throw new TimeoutException("Authentication timed out");
+        }
+        catch (Exception ex)
+        {
+            _pendingAuthRequests.TryRemove(messageId, out _);
+            _logger.LogError(ex, "Authentication failed");
+            throw;
+        }
+    }
+
+    /// <summary>
+    /// 尝试自动重连
+    /// </summary>
+    public async Task<bool> TryReconnectAsync(CancellationToken cancellationToken = default)
+    {
+        if (IsDisposed())
+        {
+            return false;
+        }
+        
+        if (!_authOptions.AutoReconnect)
+            return false;
+
+        _reconnectAttemptCount++;
+
+        if (!_authOptions.ReconnectPolicy.CanReconnect(_reconnectAttemptCount))
+        {
+            _logger.LogWarning("Max reconnect attempts ({Max}) reached", _authOptions.ReconnectPolicy.MaxReconnectAttempts);
+            return false;
+        }
+
+        var delay = _authOptions.ReconnectPolicy.GetDelay(_reconnectAttemptCount);
+        _logger.LogInformation("Attempting reconnect {Attempt}/{Max} after {DelayMs}ms",
+            _reconnectAttemptCount, _authOptions.ReconnectPolicy.MaxReconnectAttempts, delay.TotalMilliseconds);
+
+        try
+        {
+            await Task.Delay(delay, cancellationToken);
+            await ConnectAndAuthenticateAsync(cancellationToken);
+
+
+            _logger.LogInformation("Reconnected successfully");
+            _reconnectAttemptCount = 0; // 重置计数
+            return true;
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Reconnect attempt {Attempt} failed", _reconnectAttemptCount);
+            return false;
+        }
+    }
+
+    /// <summary>
     /// 断开
     /// </summary>
     public async Task DisconnectAsync()
     {
-        CheckDisposed();
+        if (IsDisposed())
+        {
+            return;
+        }
 
         lock (_stateLock)
         {
@@ -144,24 +323,41 @@ public class TcpRpcClient : IDisposable
 
     public async Task<ResponseMessage> SendRequestAsync(string method, byte[] data, int timeoutMs = 30000)
     {
-        CheckDisposed();
+        if (IsDisposed())
+        {
+            throw new Exception("Client is disposed");
+        }
 
+        return await SendRequestWithRetryAsync(method, data, timeoutMs);
+    }
+
+    private async Task<ResponseMessage> SendRequestWithRetryAsync(string method, byte[] requestData, int timeoutMs, int retryCount = 0)
+    {
         if (_state != RpcClientState.Connected)
+        {
+            // 尝试自动重连
+            if (_authOptions.AutoReconnect && await TryReconnectAsync())
+            {
+                return await SendRequestWithRetryAsync(method, requestData, timeoutMs, retryCount + 1);
+            }
             throw new InvalidOperationException($"Client is not connected. Current state: {_state}");
+        }
 
         var messageId = Interlocked.Increment(ref _nextMessageId);
         _logger.LogDebug("Sending request {MessageId} for method {Method}", messageId, method);
-        
+
         var tcs = new TaskCompletionSource<ResponseMessage>(TaskCreationOptions.RunContinuationsAsynchronously);
-        
+
         if (!_pendingRequests.TryAdd(messageId, tcs))
             throw new InvalidOperationException($"Failed to add pending request {messageId}");
-        
+
+        // 使用带 Token 的消息头
         var header = new MessageHeader
         {
             Type = MessageType.Request,
             MessageId = messageId,
-            ContentLength = data.Length
+            ContentLength = requestData.Length,
+            Token = _authToken
         };
 
         try
@@ -172,10 +368,8 @@ public class TcpRpcClient : IDisposable
             await _sendLock.WaitAsync(linkedCts.Token);
             try
             {
-                var headerBuffer = header.Serialize();
-                await _stream!.WriteAsync(headerBuffer,  linkedCts.Token);
-                await _stream!.WriteAsync(data,  linkedCts.Token);
-                await _stream!.FlushAsync(linkedCts.Token);
+                await NetworkService.WriteMessageAsync(_stream!, header, requestData, linkedCts.Token);
+                
                 _logger.LogDebug("Request {MessageId} sent, waiting for response...", messageId);
             }
             finally
@@ -193,12 +387,28 @@ public class TcpRpcClient : IDisposable
             _logger.LogWarning("Request {MessageId} timed out after {TimeoutMs}ms", messageId, timeoutMs);
             throw new TimeoutException($"Request {messageId} timed out after {timeoutMs}ms");
         }
+        catch (Exception ex) when (IsConnectionError(ex) && _authOptions.AutoReconnect && retryCount == 0)
+        {
+            _pendingRequests.TryRemove(messageId, out _);
+            _logger.LogWarning("Request {MessageId} failed due to connection error, attempting reconnect...", messageId);
+
+            if (await TryReconnectAsync())
+            {
+                return await SendRequestWithRetryAsync(method, requestData, timeoutMs, retryCount + 1);
+            }
+            throw;
+        }
         catch (Exception ex)
         {
             _pendingRequests.TryRemove(messageId, out _);
             _logger.LogError(ex, "Request {MessageId} failed", messageId);
             throw;
         }
+    }
+
+    private static bool IsConnectionError(Exception ex)
+    {
+        return ex is IOException || ex is SocketException || ex is InvalidOperationException;
     }
     
     private async Task ReceiveAsync(CancellationToken cancellationToken)
@@ -211,21 +421,39 @@ public class TcpRpcClient : IDisposable
             while (!cancellationToken.IsCancellationRequested && _stream != null)
             {
                 _logger.LogDebug("Waiting to read message header...");
-                var headerBuffer = await ReadBytesAsync(MessageHeader.HeaderSize, cancellationToken);
-                
-                var header = MessageHeader.Deserialize(headerBuffer);
-                _logger.LogDebug("Received header: Type={Type}, MessageId={MessageId}, ContentLength={ContentLength}", 
-                    header.Type, header.MessageId, header.ContentLength);
-                
-                if (header.ContentLength > 10 * 1024 * 1024) // 10MB limit
+                var header = await NetworkService.ReadMessageHeaderAsync(_stream, cancellationToken);
+                if (header == null)
                 {
-                    throw new InvalidDataException($"Message too large: {header.ContentLength} bytes");
+                    _logger.LogDebug("Connection closed while reading header");
+                    return;
                 }
 
-                var contentBuffer = await ReadBytesAsync(header.ContentLength, cancellationToken);
-                _logger.LogDebug("Received content: {Length} bytes", contentBuffer.Length);
-                
-                await ProcessMessageAsync(header, contentBuffer);
+                // 防御性检查
+                if (header.ContentLength < 0)
+                {
+                    throw new InvalidDataException($"Invalid ContentLength: {header.ContentLength}");
+                }
+
+                _logger.LogDebug("Received header: Type={Type}, MessageId={MessageId}, ContentLength={ContentLength}",
+                    header.Type, header.MessageId, header.ContentLength);
+
+                byte[]? readBytesAsync;
+                if (header.ContentLength == 0)
+                {
+                    readBytesAsync = Array.Empty<byte>();
+                }
+                else
+                {
+                    readBytesAsync = await NetworkService.ReadBytesAsync(_stream, header.ContentLength, cancellationToken);
+                    if (readBytesAsync == null)
+                    {
+                        _logger.LogDebug("Connection closed while reading content");
+                        return;
+                    }
+                }
+
+                _logger.LogDebug("Received content: {Length} bytes", readBytesAsync.Length);
+                await ProcessMessageAsync(header, readBytesAsync);
             }
         }
         catch (OperationCanceledException ex)
@@ -246,25 +474,6 @@ public class TcpRpcClient : IDisposable
         _logger.LogDebug("Receive loop ended");
     }
 
-    private async Task<byte[]> ReadBytesAsync(int bufferSize, CancellationToken cancellationToken)
-    {
-        var bytesRead = 0;
-        var buffer = new byte[bufferSize];
-        while (bytesRead < bufferSize)
-        {
-            var read = await _stream!.ReadAsync(buffer.AsMemory(bytesRead, 
-                bufferSize - bytesRead), cancellationToken);
-            if (read == 0)
-            {
-                // Connection closed by server
-                await HandleConnectionLostAsync("Server closed connection");
-                throw new OperationCanceledException("can't read message");
-            }
-            bytesRead += read;
-        }
-
-        return buffer;
-    }
 
     private Task ProcessMessageAsync(MessageHeader header, byte[] content)
     {
@@ -301,6 +510,19 @@ public class TcpRpcClient : IDisposable
                 }
                 break;
 
+            case MessageType.AuthResponse:
+                var authResponse = _serializer.DeserializeAuthResponse(content);
+                if (_pendingAuthRequests.TryRemove(headerMessageId, out var authTcs))
+                {
+                    _logger.LogDebug("Setting auth result for request {MessageId}", headerMessageId);
+                    authTcs.TrySetResult(authResponse);
+                }
+                else
+                {
+                    _logger.LogWarning("Received auth response for unknown request {MessageId}", headerMessageId);
+                }
+                break;
+
             case MessageType.Pong:
                 if (_pendingPings.TryRemove(headerMessageId, out var pingTcs))
                 {
@@ -333,6 +555,28 @@ public class TcpRpcClient : IDisposable
         }
         _pendingRequests.Clear();
 
+        foreach (var kvp in _pendingAuthRequests)
+        {
+            kvp.Value.TrySetException(new Exception($"Connection lost: {reason}"));
+        }
+        _pendingAuthRequests.Clear();
+
+        // 触发自动重连
+        if (_authOptions.AutoReconnect && _authOptions.ReconnectPolicy.CanReconnect(_reconnectAttemptCount + 1))
+        {
+            _ = Task.Run(async () =>
+            {
+                try
+                {
+                    await TryReconnectAsync();
+                }
+                catch (Exception ex)
+                {
+                    _logger.LogError(ex, "Background reconnect failed");
+                }
+            });
+        }
+
         await Task.CompletedTask;
     }
     
@@ -342,10 +586,9 @@ public class TcpRpcClient : IDisposable
         return _tcpClient?.Connected == true && _stream != null && _state == RpcClientState.Connected;
     }
 
-    private void CheckDisposed()
+    private bool IsDisposed()
     {
-        if (Interlocked.CompareExchange(ref _disposed, 0, 0) == 1)
-            throw new ObjectDisposedException(nameof(TcpRpcClient));
+        return Interlocked.CompareExchange(ref _disposed, 0, 0) == 1;
     }
 
     /// <summary>
@@ -355,7 +598,10 @@ public class TcpRpcClient : IDisposable
     /// <returns></returns>
     public async Task<bool> PingAsync(int timeoutMs = 5000)
     {
-        CheckDisposed();
+        if (IsDisposed())
+        {
+            return false;
+        }
 
         if (_state != RpcClientState.Connected)
             return false;
@@ -384,9 +630,7 @@ public class TcpRpcClient : IDisposable
             await _sendLock.WaitAsync(linkedCts.Token);
             try
             {
-                var headerBuffer = header.Serialize();
-                await _stream!.WriteAsync(headerBuffer, 0, headerBuffer.Length, linkedCts.Token);
-                await _stream!.FlushAsync(linkedCts.Token);
+                await NetworkService.WriteMessageAsync(_stream!, header, null, linkedCts.Token);
             }
             finally
             {
@@ -416,10 +660,13 @@ public class TcpRpcClient : IDisposable
     public void Dispose()
     {
         if (Interlocked.Exchange(ref _disposed, 1) == 1)
+        {
             return;
+        }
 
         try
         {
+            _logger.LogInformation("Disposing client");
             DisconnectAsync().Wait(TimeSpan.FromSeconds(5));
         }
         catch

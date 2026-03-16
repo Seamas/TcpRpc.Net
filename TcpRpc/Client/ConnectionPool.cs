@@ -15,6 +15,7 @@ public class ConnectionPool : IDisposable
     private readonly TimeSpan _maxIdleTime;
     private readonly ILoggerFactory _loggerFactory;
     private readonly IMessageSerializer _messageSerializer;
+    private readonly ClientAuthOptions _authOptions;
     private readonly ConcurrentBag<PooledConnection> _availableConnections = new();
     private readonly ConcurrentDictionary<TcpRpcClient, PooledConnection> _allConnections = new();
     private int _connectionCount;
@@ -22,7 +23,8 @@ public class ConnectionPool : IDisposable
     private readonly Timer _cleanupTimer;
     private bool _disposed;
 
-    public ConnectionPool(string host, int port, IMessageSerializer messageSerializer, ILoggerFactory loggerFactory, int maxSize = 10, TimeSpan? maxIdleTime = null)
+    public ConnectionPool(string host, int port, IMessageSerializer messageSerializer, ILoggerFactory loggerFactory,
+        int maxSize = 10, ClientAuthOptions? authOptions = null, TimeSpan? maxIdleTime = null)
     {
         _host = host ?? throw new ArgumentNullException(nameof(host));
         _port = port;
@@ -30,6 +32,7 @@ public class ConnectionPool : IDisposable
         _messageSerializer = messageSerializer;
         _maxIdleTime = maxIdleTime ?? TimeSpan.FromMinutes(5);
         _loggerFactory = loggerFactory;
+        _authOptions = authOptions ?? new ClientAuthOptions();
         _semaphore = new SemaphoreSlim(maxSize, maxSize);
         _cleanupTimer = new Timer(CleanupIdleConnections, null, TimeSpan.FromMinutes(1), TimeSpan.FromMinutes(1));
     }
@@ -112,8 +115,8 @@ public class ConnectionPool : IDisposable
 
     private async Task<TcpRpcClient> CreateNewConnectionAsync()
     {
-        var client = new TcpRpcClient(_host, _port, _messageSerializer, _loggerFactory);
-        await client.ConnectAsync();
+        var client = new TcpRpcClient(_host, _port, _messageSerializer, _loggerFactory, _authOptions);
+        await client.ConnectAndAuthenticateAsync();
         return client;
     }
 

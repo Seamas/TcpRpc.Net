@@ -13,17 +13,20 @@ public class RpcClientFactory : IDisposable
     private readonly ConnectionPool? _connectionPool;
     private readonly ILoggerFactory _loggerFactory;
     private readonly IMessageSerializer _messageSerializer;
+    private readonly ClientAuthOptions _authOptions;
 
-    public RpcClientFactory(string host, int port, IMessageSerializer messageSerializer,ILoggerFactory loggerFactory, bool usePool = true, int poolSize = 10)
+    public RpcClientFactory(string host, int port, IMessageSerializer messageSerializer, ILoggerFactory loggerFactory,
+        bool usePool = true, int poolSize = 10, ClientAuthOptions? authOptions = null)
     {
         _host = host;
         _port = port;
         _messageSerializer = messageSerializer;
         _loggerFactory = loggerFactory;
+        _authOptions = authOptions ?? new ClientAuthOptions();
 
         if (usePool)
         {
-            _connectionPool = new ConnectionPool(host, port, messageSerializer, loggerFactory, poolSize);
+            _connectionPool = new ConnectionPool(host, port, messageSerializer, loggerFactory, poolSize, _authOptions);
         }
     }
 
@@ -36,9 +39,9 @@ public class RpcClientFactory : IDisposable
         {
             return await _connectionPool.GetProxyAsync<T>(cancellationToken);
         }
-        
-        var client = new TcpRpcClient(_host, _port, _messageSerializer, factory: _loggerFactory);
-        await client.ConnectAsync();
+
+        var client = new TcpRpcClient(_host, _port, _messageSerializer, _loggerFactory, _authOptions);
+        await client.ConnectAndAuthenticateAsync(cancellationToken);
         return RpcClientProxy.Create<T>(client, _messageSerializer, _loggerFactory);
     }
 
@@ -51,9 +54,24 @@ public class RpcClientFactory : IDisposable
         {
             return await _connectionPool.AcquireAsync(cancellationToken);
         }
-        
-        var client = new TcpRpcClient(_host, _port, _messageSerializer, _loggerFactory);
-        await client.ConnectAsync();
+
+        var client = new TcpRpcClient(_host, _port, _messageSerializer, _loggerFactory, _authOptions);
+        await client.ConnectAndAuthenticateAsync(cancellationToken);
+        return client;
+    }
+
+    /// <summary>
+    /// 创建客户端（仅连接，不认证）
+    /// </summary>
+    public async Task<TcpRpcClient> CreateClientWithoutAuthAsync(CancellationToken cancellationToken = default)
+    {
+        if (_connectionPool != null)
+        {
+            return await _connectionPool.AcquireAsync(cancellationToken);
+        }
+
+        var client = new TcpRpcClient(_host, _port, _messageSerializer, _loggerFactory, _authOptions);
+        await client.ConnectAsync(cancellationToken);
         return client;
     }
 
@@ -63,6 +81,26 @@ public class RpcClientFactory : IDisposable
     public void ReleaseClient(TcpRpcClient client)
     {
         _connectionPool?.Release(client);
+    }
+
+    /// <summary>
+    /// 更新认证凭证
+    /// </summary>
+    public void SetCredentials(Dictionary<string, string> credentials)
+    {
+        _authOptions.Credentials.Clear();
+        foreach (var kvp in credentials)
+        {
+            _authOptions.Credentials[kvp.Key] = kvp.Value;
+        }
+    }
+
+    /// <summary>
+    /// 设置客户端标识
+    /// </summary>
+    public void SetClientId(string clientId)
+    {
+        _authOptions.ClientId = clientId;
     }
 
     public void Dispose()

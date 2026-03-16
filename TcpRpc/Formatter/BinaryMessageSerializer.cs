@@ -1,4 +1,3 @@
-using System.Buffers.Binary;
 using System.Text;
 using System.Text.Json;
 using TcpRpc.Message;
@@ -240,15 +239,15 @@ public class BinaryMessageSerializer : IMessageSerializer
         return Encoding.GetString(bytes);
     }
 
-    private string?[]? ReadStringArray(BinaryReader reader)
+    private string[]? ReadStringArray(BinaryReader reader)
     {
         var length = reader.ReadInt32();
         if (length == -1) return null;
 
-        var array = new string?[length];
+        var array = new string[length];
         for (int i = 0; i < length; i++)
         {
-            array[i] = ReadString(reader);
+            array[i] = ReadString(reader) ?? string.Empty;
         }
         return array;
     }
@@ -298,7 +297,7 @@ public class BinaryMessageSerializer : IMessageSerializer
                 return reader.ReadBytes(byteLength);
 
             case TypeObject:
-                var typeName = ReadString(reader);
+                var typeName = ReadString(reader) ?? string.Empty;
                 
                 var jsonLength = reader.ReadInt32();
                 var jsonBytes = reader.ReadBytes(jsonLength);
@@ -307,12 +306,137 @@ public class BinaryMessageSerializer : IMessageSerializer
 
                 var rawText = jsonElement.GetRawText();
                 var type = Type.GetType(typeName);
+                if (type == null)
+                {
+                    throw new InvalidOperationException($"Type not found: {typeName}");
+                }
 
                 return JsonSerializer.Deserialize(rawText, type);
 
             default:
                 throw new InvalidOperationException($"Unknown type marker: {typeMarker}");
         }
+    }
+
+    #endregion
+
+    #region Auth Messages
+
+    public byte[] SerializeAuthRequest(AuthRequestMessage request)
+    {
+        using var ms = new MemoryStream();
+        using (var writer = new BinaryWriter(ms, Encoding))
+        {
+            // ClientId
+            WriteString(writer, request.ClientId);
+            // PreviousToken
+            WriteString(writer, request.PreviousToken);
+            // Credentials count
+            if (request.Credentials == null)
+            {
+                writer.Write(-1);
+            }
+            else
+            {
+                writer.Write(request.Credentials.Count);
+                foreach (var kvp in request.Credentials)
+                {
+                    WriteString(writer, kvp.Key);
+                    WriteString(writer, kvp.Value);
+                }
+            }
+        }
+        return ms.ToArray();
+    }
+
+    public AuthRequestMessage DeserializeAuthRequest(byte[] data)
+    {
+        using var ms = new MemoryStream(data);
+        using var reader = new BinaryReader(ms, Encoding);
+
+        var clientId = ReadString(reader);
+        var previousToken = ReadString(reader);
+
+        Dictionary<string, string>? credentials = null;
+        var count = reader.ReadInt32();
+        if (count >= 0)
+        {
+            credentials = new Dictionary<string, string>();
+            for (int i = 0; i < count; i++)
+            {
+                var key = ReadString(reader);
+                var value = ReadString(reader);
+                if (key != null)
+                {
+                    credentials[key] = value ?? string.Empty;
+                }
+            }
+        }
+
+        return new AuthRequestMessage
+        {
+            ClientId = clientId,
+            PreviousToken = previousToken,
+            Credentials = credentials
+        };
+    }
+
+    public byte[] SerializeAuthResponse(AuthResponseMessage response)
+    {
+        using var ms = new MemoryStream();
+        using (var writer = new BinaryWriter(ms, Encoding))
+        {
+            // Success
+            writer.Write(response.Success);
+            // ErrorMessage
+            WriteString(writer, response.ErrorMessage);
+            // ClientId
+            WriteString(writer, response.ClientId);
+            // Token
+            WriteString(writer, response.Token);
+            // ExpiresAt
+            writer.Write(response.ExpiresAt.HasValue);
+            if (response.ExpiresAt.HasValue)
+            {
+                writer.Write(response.ExpiresAt.Value.ToBinary());
+            }
+            // IsSessionRestored
+            writer.Write(response.IsSessionRestored);
+            // Message
+            WriteString(writer, response.Message);
+        }
+        return ms.ToArray();
+    }
+
+    public AuthResponseMessage DeserializeAuthResponse(byte[] data)
+    {
+        using var ms = new MemoryStream(data);
+        using var reader = new BinaryReader(ms, Encoding);
+
+        var success = reader.ReadBoolean();
+        var errorMessage = ReadString(reader);
+        var clientId = ReadString(reader);
+        var token = ReadString(reader);
+
+        DateTime? expiresAt = null;
+        if (reader.ReadBoolean())
+        {
+            expiresAt = DateTime.FromBinary(reader.ReadInt64());
+        }
+
+        var isSessionRestored = reader.ReadBoolean();
+        var message = ReadString(reader);
+
+        return new AuthResponseMessage
+        {
+            Success = success,
+            ErrorMessage = errorMessage,
+            ClientId = clientId,
+            Token = token,
+            ExpiresAt = expiresAt,
+            IsSessionRestored = isSessionRestored,
+            Message = message
+        };
     }
 
     #endregion

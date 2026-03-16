@@ -1,4 +1,5 @@
 using System.Buffers.Binary;
+using System.Text;
 
 namespace TcpRpc.Message;
 
@@ -7,15 +8,19 @@ namespace TcpRpc.Message;
 /// </summary>
 public class MessageHeader
 {
-    public const int HeaderSize = 14; // 1 (Type) + 8 (MessageId) + 4 (ContentLength) + 1 (Flags)
-
+    // 长度1
     public MessageType Type { get; set; }
+    // 长度8
     public long MessageId { get; set; }
+    // 长度4
     public int ContentLength { get; set; }
     /// <summary>
+    /// 长度1
     /// 标志位: 0x01=Void返回, 0x02=有异常, 0x04=压缩
     /// </summary>
     public byte Flags { get; set; }
+    
+    public string? Token { get; set; }
 
     public bool IsVoid => (Flags & 0x01) != 0;
     public bool HasException => (Flags & 0x02) != 0;
@@ -35,25 +40,34 @@ public class MessageHeader
 
     public byte[] Serialize()
     {
-        var buffer = new byte[HeaderSize];
-        buffer[0] = (byte)Type;
-        BinaryPrimitives.WriteInt64LittleEndian(buffer.AsSpan(1), MessageId);
-        BinaryPrimitives.WriteInt32LittleEndian(buffer.AsSpan(9), ContentLength);
-        buffer[13] = Flags;
-        return buffer;
+        using var ms = new MemoryStream();
+        using var writer = new BinaryWriter(ms, Encoding.UTF8, true);
+        writer.Write((byte)Type);
+        writer.Write(MessageId);
+        writer.Write(ContentLength);
+        writer.Write(Flags);
+        writer.Write(Token ?? string.Empty);
+        return ms.ToArray();
     }
 
     public static MessageHeader Deserialize(byte[] buffer)
     {
-        if (buffer.Length < HeaderSize)
-            throw new ArgumentException($"Buffer size must be at least {HeaderSize} bytes");
+        using var ms = new MemoryStream(buffer);
+        using var reader = new BinaryReader(ms, Encoding.UTF8, true);
 
+        var readByte = (MessageType) reader.ReadByte();
+        var messageId = reader.ReadInt64();
+        var contentLength = reader.ReadInt32();
+        var flags = reader.ReadByte();
+        var token = reader.ReadString();
+        
         return new MessageHeader
         {
-            Type = (MessageType)buffer[0],
-            MessageId = BinaryPrimitives.ReadInt64LittleEndian(buffer.AsSpan(1)),
-            ContentLength = BinaryPrimitives.ReadInt32LittleEndian(buffer.AsSpan(9)),
-            Flags = buffer[13]
+            Type = readByte,
+            MessageId = messageId,
+            ContentLength = contentLength,
+            Flags = flags,
+            Token = token
         };
     }
 }

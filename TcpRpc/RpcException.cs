@@ -26,7 +26,7 @@ public class RpcException : Exception
         RemoteStackTrace = remoteStackTrace;
     }
 
-    public override string StackTrace => RemoteStackTrace ?? base.StackTrace;
+    public override string StackTrace => RemoteStackTrace ?? base.StackTrace ?? string.Empty;
 
     public override string ToString()
     {

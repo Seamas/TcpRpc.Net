@@ -10,16 +10,16 @@ namespace TcpRpc.Client;
 /// </summary>
 public class RpcClientProxy : DispatchProxy
 {
-    private TcpRpcClient _client;
-    private Type _interfaceType;
-    private ILoggerFactory _factory;
-    private ILogger<RpcClientProxy> _logger;
-    private IMessageSerializer _serializer;
+    private TcpRpcClient _client = null!;
+    private Type _interfaceType = null!;
+    private ILoggerFactory _factory = null!;
+    private ILogger<RpcClientProxy> _logger = null!;
+    private IMessageSerializer _serializer = null!;
     
     /// <summary>
     /// 创建代理实例
     /// </summary>
-    public static T Create<T>(TcpRpcClient client, IMessageSerializer _serializer, ILoggerFactory factory) where T : class
+    public static T Create<T>(TcpRpcClient client, IMessageSerializer serializer, ILoggerFactory factory) where T : class
     {
         if (client == null)
             throw new ArgumentNullException(nameof(client));
@@ -28,7 +28,7 @@ public class RpcClientProxy : DispatchProxy
         var rpcProxy = (RpcClientProxy)(object)proxy;
         rpcProxy._client = client;
         rpcProxy._interfaceType = typeof(T);
-        rpcProxy._serializer = _serializer;
+        rpcProxy._serializer = serializer;
         rpcProxy._factory = factory;
         rpcProxy._logger = rpcProxy._factory.CreateLogger<RpcClientProxy>();
 
@@ -69,9 +69,9 @@ public class RpcClientProxy : DispatchProxy
         {
             // 发送请求
             var response = SendRequestAsync(request).GetAwaiter().GetResult();
-
+            
             // 处理异常
-            if (!response.Success)
+            if (response.Success)
             {
                 if (!string.IsNullOrEmpty(response.ExceptionType))
                 {
@@ -118,7 +118,7 @@ public class RpcClientProxy : DispatchProxy
         var requestData = _serializer.SerializeRequest(request);
 
         // 使用客户端发送请求
-        var response = await _client!.SendRequestAsync(
+        var response = await _client.SendRequestAsync(
             $"{request.ServiceType}.{request.Method}",
             requestData);
 
